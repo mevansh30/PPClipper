@@ -3,6 +3,7 @@ import datetime
 import requests
 import os
 from dotenv import load_dotenv
+import pytz  # for timezone-aware datetime
 
 load_dotenv()
 
@@ -16,51 +17,73 @@ DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK")
 def create_clip():
     user = request.args.get('user', 'someone')
 
-    # 1. Get current live video ID from channel
+    # Check all required ENV vars are present
+    if not all([YOUTUBE_API_KEY, CHANNEL_ID, DISCORD_WEBHOOK_URL]):
+        return "Missing environment variables. Check .env or Railway variables."
+
+    # Step 1: Get current live video ID
     video_id = get_active_live_video_id()
     if not video_id:
         return "No live stream found."
 
-    # 2. Get stream start time
+    # Step 2: Get stream start time
     stream_start = get_stream_start_time(video_id)
     if not stream_start:
         return "Couldn't fetch stream start time."
 
-    # 3. Calculate timestamp for 35 seconds ago
-    now = datetime.datetime.utcnow()
+    # Step 3: Calculate timestamp for 35 seconds ago
+    now = datetime.datetime.now(pytz.UTC)
     clip_time = now - datetime.timedelta(seconds=35)
-    seconds_since_start = int((clip_time - stream_start).total_seconds())
-    seconds_since_start = max(0, seconds_since_start)
 
-    # 4. Generate YouTube clip link
+    try:
+        stream_start = stream_start.astimezone(pytz.UTC)
+        seconds_since_start = int((clip_time - stream_start).total_seconds())
+        seconds_since_start = max(0, seconds_since_start)
+    except Exception as e:
+        return f"Time math failed: {str(e)}"
+
+    # Step 4: Generate YouTube link with timestamp
     clip_url = f"https://www.youtube.com/watch?v={video_id}&t={seconds_since_start}s"
 
-    # 5. Send to Discord
+    # Step 5: Send to Discord
     message = f"🎬 New Clip by **{user}**: {clip_url}"
-    requests.post(DISCORD_WEBHOOK_URL, json={"content": message})
+    try:
+        requests.post(DISCORD_WEBHOOK_URL, json={"content": message})
+    except Exception as e:
+        return f"Failed to send to Discord: {str(e)}"
 
-    return f"Clip created: {clip_url}"
+    return f"✅ Clip created: {clip_url}"
 
 def get_active_live_video_id():
-    url = (
-        f"https://www.googleapis.com/youtube/v3/search?part=snippet"
-        f"&channelId={CHANNEL_ID}&eventType=live&type=video&key={YOUTUBE_API_KEY}"
-    )
-    r = requests.get(url)
-    data = r.json()
-    items = data.get('items', [])
-    if items:
-        return items[0]['id']['videoId']
-    return None
+    try:
+        url = (
+            f"https://www.googleapis.com/youtube/v3/search?part=snippet"
+            f"&channelId={CHANNEL_ID}&eventType=live&type=video&key={YOUTUBE_API_KEY}"
+        )
+        r = requests.get(url, timeout=5)
+        r.raise_for_status()
+        data = r.json()
+        items = data.get('items', [])
+        if items:
+            return items[0]['id']['videoId']
+        return None
+    except Exception as e:
+        print("Error getting live video:", e)
+        return None
 
 def get_stream_start_time(video_id):
-    url = f"https://www.googleapis.com/youtube/v3/videos?part=liveStreamingDetails&id={video_id}&key={YOUTUBE_API_KEY}"
-    r = requests.get(url)
-    data = r.json()
     try:
-        start_time = data["items"][0]["liveStreamingDetails"]["actualStartTime"]
-        return datetime.datetime.fromisoformat(start_time.replace("Z", "+00:00"))
-    except Exception:
+        url = (
+            f"https://www.googleapis.com/youtube/v3/videos?"
+            f"part=liveStreamingDetails&id={video_id}&key={YOUTUBE_API_KEY}"
+        )
+        r = requests.get(url, timeout=5)
+        r.raise_for_status()
+        data = r.json()
+        start_time_str = data["items"][0]["liveStreamingDetails"]["actualStartTime"]
+        return datetime.datetime.fromisoformat(start_time_str.replace("Z", "+00:00"))
+    except Exception as e:
+        print("Error getting start time:", e)
         return None
 
 if __name__ == "__main__":
