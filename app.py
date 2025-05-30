@@ -88,3 +88,11 @@ def get_stream_start_time(video_id):
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080)
+
+@app.route("/")
+def home():
+    return "PPClipper is alive!", 200
+
+@app.route("/ping")
+def ping():
+    return "pong", 200
