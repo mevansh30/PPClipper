@@ -13,6 +13,14 @@ YOUTUBE_API_KEY = os.getenv("YT_API_KEY")
 CHANNEL_ID = os.getenv("YT_CHANNEL_ID")
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK")
 
+@app.route("/")
+def home():
+    return "PPClipper is alive!", 200
+
+@app.route("/ping")
+def ping():
+    return "pong", 200
+
 @app.route("/clip")
 def create_clip():
     user = request.args.get('user', 'someone')
@@ -88,11 +96,3 @@ def get_stream_start_time(video_id):
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080)
-
-@app.route("/")
-def home():
-    return "PPClipper is alive!", 200
-
-@app.route("/ping")
-def ping():
-    return "pong", 200
