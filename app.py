@@ -15,7 +15,7 @@ DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK")
 
 @app.route("/")
 def home():
-    return "PPClipper is alive!", 200
+    return "ClipSync_V1 is alive!", 200
 
 @app.route("/ping")
 def ping():
@@ -24,10 +24,7 @@ def ping():
 @app.route("/clip")
 def create_clip():
     user = request.args.get('user', 'someone')
-
-    # Check all required ENV vars are present
-    if not all([YOUTUBE_API_KEY, CHANNEL_ID, DISCORD_WEBHOOK_URL]):
-        return "Missing environment variables. Check .env or Railway variables."
+    name = request.args.get('name', '').strip()
 
     # Step 1: Get current live video ID
     video_id = get_active_live_video_id()
@@ -39,7 +36,7 @@ def create_clip():
     if not stream_start:
         return "Couldn't fetch stream start time."
 
-    # Step 3: Calculate timestamp for 35 seconds ago
+    # Step 3: Calculate timestamp
     now = datetime.datetime.now(pytz.UTC)
     clip_time = now - datetime.timedelta(seconds=35)
 
@@ -50,17 +47,20 @@ def create_clip():
     except Exception as e:
         return f"Time math failed: {str(e)}"
 
-    # Step 4: Generate YouTube link with timestamp
+    # Step 4: Generate YouTube timestamped link
     clip_url = f"https://www.youtube.com/watch?v={video_id}&t={seconds_since_start}s"
 
-    # Step 5: Send to Discord
-    message = f"🎬 New Clip by **{user}**: {clip_url}"
+    # Step 5: Format and send to Discord
+    clip_title = f" [{name}]" if name else ""
+    message = f"🎬 New Clip by **{user}**{clip_title}: {clip_url}"
+
     try:
         requests.post(DISCORD_WEBHOOK_URL, json={"content": message})
     except Exception as e:
         return f"Failed to send to Discord: {str(e)}"
 
-    return f"✅ Clip created: {clip_url}"
+    return f"✅ Clip created{clip_title}: {clip_url}"
+
 
 def get_active_live_video_id():
     try:
