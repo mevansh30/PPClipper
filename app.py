@@ -12,10 +12,12 @@ load_dotenv()
 app = Flask(__name__)
 CORS(app)
 
+# Environment Variables
 YOUTUBE_API_KEY = os.getenv("YT_API_KEY")
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK")
+ADMIN_API_KEY = os.getenv("ADMIN_API_KEY")  # New admin key
 
-# Use DB to manage multiple channels
+# Database Config
 DATABASE = 'clips.db'
 
 def get_db():
@@ -44,7 +46,6 @@ def init_db():
                 thumbnail_url TEXT NOT NULL,
                 video_id TEXT NOT NULL,
                 timestamp TEXT NOT NULL,
-                channel_id TEXT DEFAULT NULL,
                 level TEXT DEFAULT 'unknown'
             )
         ''')
@@ -52,17 +53,14 @@ def init_db():
             CREATE TABLE IF NOT EXISTS channels (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 channel_id TEXT NOT NULL UNIQUE,
-                name TEXT DEFAULT NULL
+                name TEXT
             )
         ''')
+        cursor.execute("SELECT COUNT(*) FROM channels")
+        if cursor.fetchone()[0] == 0:
+            cursor.execute("INSERT INTO channels (channel_id, name) VALUES (?, ?)", ("UC4rnJFlsO1TC9FJMTWMPNdw", "Default Channel"))
         db.commit()
-        print("Database initialized successfully.")
-
-def get_all_channel_ids():
-    db = get_db()
-    cursor = db.cursor()
-    cursor.execute("SELECT channel_id FROM channels")
-    return [row['channel_id'] for row in cursor.fetchall()]
+        print("Database initialized.")
 
 @app.route("/")
 def home():
@@ -80,12 +78,11 @@ def show_clip_grid():
 def create_clip():
     user = request.args.get('user', 'someone')
     name = request.args.get('name', '').strip()
-
-    result = get_active_live_video_id()
-    if not result:
+    
+    video_id = get_active_live_video_id()
+    if not video_id:
         return "No live stream found.", 404
 
-    video_id, channel_id_used = result
     stream_start = get_stream_start_time(video_id)
     if not stream_start:
         return "Couldn't fetch stream start time.", 500
@@ -103,7 +100,7 @@ def create_clip():
     clip_url = f"https://www.youtube.com/watch?v={video_id}&t={seconds_since_start}s"
     thumbnail_url = f"https://img.youtube.com/vi/{video_id}/mqdefault.jpg"
     clip_title_display = f" [{name}]" if name else ""
-    message = f"\U0001F3AC New Clip by **{user}**{clip_title_display}: {clip_url}"
+    message = f"\ud83c\udfaC New Clip by **{user}**{clip_title_display}: {clip_url}"
 
     try:
         requests.post(DISCORD_WEBHOOK_URL, json={"content": message})
@@ -114,12 +111,11 @@ def create_clip():
     try:
         cursor = db.cursor()
         cursor.execute(
-            "INSERT INTO clips (title, user, clip_url, thumbnail_url, video_id, timestamp, channel_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (name, user, clip_url, thumbnail_url, video_id, now.isoformat(), channel_id_used)
+            "INSERT INTO clips (title, user, clip_url, thumbnail_url, video_id, timestamp) VALUES (?, ?, ?, ?, ?, ?)",
+            (name, user, clip_url, thumbnail_url, video_id, now.isoformat())
         )
         db.commit()
     except sqlite3.Error as e:
-        print(f"DB Error: {e}")
         return "Failed to save clip to database.", 500
 
     return f"\u2705 Clip created{clip_title_display}: {clip_url}", 200
@@ -129,12 +125,13 @@ def get_clips():
     page = request.args.get('page', 1, type=int)
     limit = request.args.get('limit', 12, type=int)
     search_query = request.args.get('search', '').strip()
-    offset = (page - 1) * limit
+    level_filter = request.args.get('level', 'all').strip()
 
+    offset = (page - 1) * limit
     db = get_db()
     cursor = db.cursor()
 
-    query = "SELECT id, title, user, clip_url, thumbnail_url, video_id, timestamp, channel_id FROM clips"
+    query = "SELECT id, title, user, clip_url, thumbnail_url, video_id, timestamp FROM clips"
     count_query = "SELECT COUNT(*) FROM clips"
     conditions = []
     params = []
@@ -174,36 +171,74 @@ def get_clips():
         }
     })
 
+@app.route("/admin/add_channel", methods=["POST"])
+def add_channel():
+    if request.headers.get("x-api-key") != ADMIN_API_KEY:
+        return jsonify({"error": "Unauthorized"}), 403
+
+    data = request.json
+    channel_id = data.get("channel_id")
+    name = data.get("name", "Unnamed Channel")
+
+    if not channel_id:
+        return jsonify({"error": "channel_id is required"}), 400
+
+    db = get_db()
+    cursor = db.cursor()
+
+    try:
+        cursor.execute("INSERT INTO channels (channel_id, name) VALUES (?, ?)", (channel_id, name))
+        db.commit()
+        return jsonify({"status": "added", "channel_id": channel_id, "name": name}), 201
+    except sqlite3.IntegrityError:
+        return jsonify({"error": "Channel ID already exists"}), 409
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/admin/list_channels")
+def list_channels():
+    if request.headers.get("x-api-key") != ADMIN_API_KEY:
+        return jsonify({"error": "Unauthorized"}), 403
+
+    db = get_db()
+    cursor = db.cursor()
+    cursor.execute("SELECT * FROM channels")
+    rows = cursor.fetchall()
+    return jsonify([dict(row) for row in rows])
+
 def get_active_live_video_id():
-    for channel_id in get_all_channel_ids():
-        try:
+    try:
+        db = get_db()
+        cursor = db.cursor()
+        cursor.execute("SELECT channel_id FROM channels")
+        channels = cursor.fetchall()
+        for row in channels:
+            channel_id = row["channel_id"]
             url = (
                 f"https://www.googleapis.com/youtube/v3/search?part=snippet"
                 f"&channelId={channel_id}&eventType=live&type=video&key={YOUTUBE_API_KEY}"
             )
             r = requests.get(url, timeout=5)
             r.raise_for_status()
-            data = r.json()
-            items = data.get('items', [])
+            items = r.json().get('items', [])
             if items:
-                return items[0]['id']['videoId'], channel_id
-        except Exception as e:
-            print(f"Error fetching live video for {channel_id}: {e}")
-    return None
+                return items[0]['id']['videoId']
+        return None
+    except Exception as e:
+        print(f"Error getting live video: {e}")
+        return None
 
 def get_stream_start_time(video_id):
     try:
         url = (
-            f"https://www.googleapis.com/youtube/v3/videos?"
-            f"part=liveStreamingDetails&id={video_id}&key={YOUTUBE_API_KEY}"
+            f"https://www.googleapis.com/youtube/v3/videos?part=liveStreamingDetails&id={video_id}&key={YOUTUBE_API_KEY}"
         )
         r = requests.get(url, timeout=5)
         r.raise_for_status()
-        data = r.json()
-        start_time_str = data["items"][0]["liveStreamingDetails"]["actualStartTime"]
+        start_time_str = r.json()["items"][0]["liveStreamingDetails"]["actualStartTime"]
         return datetime.datetime.fromisoformat(start_time_str.replace("Z", "+00:00"))
     except Exception as e:
-        print(f"Error fetching stream start time: {e}")
+        print(f"Error getting stream start time: {e}")
         return None
 
 with app.app_context():
