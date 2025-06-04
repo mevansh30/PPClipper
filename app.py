@@ -5,10 +5,14 @@ import os
 from dotenv import load_dotenv
 import pytz
 import sqlite3 # Import sqlite3 for database operations
+from flask_cors import CORS
+
 
 load_dotenv()
 
 app = Flask(__name__)
+CORS(app)  # ✅ This enables CORS for all routes
+
 
 # Environment variables
 YOUTUBE_API_KEY = os.getenv("YT_API_KEY")
