@@ -1,83 +1,85 @@
-from flask import Flask, request, jsonify, render_template, g
+import os
 import datetime
 import requests
-import os
-from dotenv import load_dotenv
 import pytz
-import sqlite3
-from flask_cors import CORS
-from functools import wraps # For decorator
+from functools import wraps
+from dotenv import load_dotenv
 
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+from flask_sqlalchemy import SQLAlchemy
+from sqlalchemy.exc import IntegrityError
+
+# --- Initialization ---
 load_dotenv()
 
 app = Flask(__name__)
-CORS(app) # Enable CORS for all routes
+CORS(app)
 
-# Environment Variables
+# --- Environment Variables ---
 YOUTUBE_API_KEY = os.getenv("YT_API_KEY")
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK")
 ADMIN_API_KEY = os.getenv("ADMIN_API_KEY")
+DATABASE_URL = os.getenv("DATABASE_URL")
 
-# Database Config
-DATABASE = 'clips.db'
+# --- Database Configuration (PostgreSQL with SQLAlchemy) ---
+if not DATABASE_URL:
+    raise RuntimeError("FATAL: DATABASE_URL is not set. The app cannot connect to the database.")
 
-# --- Database Helper Functions ---
-def get_db():
-    db = getattr(g, '_database', None)
-    if db is None:
-        db = g._database = sqlite3.connect(DATABASE)
-        db.row_factory = sqlite3.Row # Access columns by name
-    return db
+app.config['SQLALCHEMY_DATABASE_URI'] = DATABASE_URL
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
-@app.teardown_appcontext
-def close_connection(exception):
-    db = getattr(g, '_database', None)
-    if db is not None:
-        db.close()
+db = SQLAlchemy(app)
 
+# --- Database Models ---
+# These classes define the structure of your database tables.
+
+class Clip(db.Model):
+    __tablename__ = 'clips'
+    id = db.Column(db.Integer, primary_key=True)
+    title = db.Column(db.String(255), nullable=False)
+    user = db.Column(db.String(100), nullable=False)
+    clip_url = db.Column(db.String(500), nullable=False)
+    thumbnail_url = db.Column(db.String(500), nullable=False)
+    video_id = db.Column(db.String(100), nullable=False)
+    timestamp = db.Column(db.String(100), nullable=False)
+    level = db.Column(db.String(50), default='unknown')
+
+    def to_dict(self):
+        return {c.name: getattr(self, c.name) for c in self.__table__.columns}
+
+class Channel(db.Model):
+    __tablename__ = 'channels'
+    id = db.Column(db.Integer, primary_key=True)
+    channel_id = db.Column(db.String(100), unique=True, nullable=False)
+    name = db.Column(db.String(255), nullable=True)
+    
+    def to_dict(self):
+        return {c.name: getattr(self, c.name) for c in self.__table__.columns}
+
+# --- Database Initialization Function ---
 def init_db():
     with app.app_context():
-        db = get_db()
-        cursor = db.cursor()
-        # Create clips table
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS clips (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                title TEXT NOT NULL,
-                user TEXT NOT NULL,
-                clip_url TEXT NOT NULL,
-                thumbnail_url TEXT NOT NULL,
-                video_id TEXT NOT NULL,
-                timestamp TEXT NOT NULL,
-                level TEXT DEFAULT 'unknown'
-            )
-        ''')
-        # Create channels table
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS channels (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                channel_id TEXT NOT NULL UNIQUE,
-                name TEXT
-            )
-        ''')
-        # Add a default channel if none exist
-        cursor.execute("SELECT COUNT(*) FROM channels")
-        if cursor.fetchone()[0] == 0:
-            try:
-                cursor.execute("INSERT INTO channels (channel_id, name) VALUES (?, ?)", 
-                               ("UC4rnJFlsO1TC9FJMTWMPNdw", "Default Example Channel"))
-                print("Inserted default channel.")
-            except sqlite3.IntegrityError:
-                print("Default channel already exists or another issue.") # Should not happen with COUNT(*) check
-        db.commit()
-        print("Database initialized.")
+        print("Initializing database schema...")
+        db.create_all() # Creates tables from the models above if they don't exist
+        
+        # Add a default channel if the table is empty
+        if not Channel.query.first():
+            print("No channels found, adding default channel.")
+            default_channel = Channel(channel_id="UC4rnJFlsO1TC9FJMTWMPNdw", name="Default Example Channel")
+            db.session.add(default_channel)
+            db.session.commit()
+            print("Default channel added.")
+        else:
+            print("Database already contains channels.")
+        print("Database initialization complete.")
 
-# --- Admin Auth Decorator ---
+# --- Admin Auth Decorator (Unchanged) ---
 def admin_required(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
         if not ADMIN_API_KEY:
-            print("CRITICAL: ADMIN_API_KEY is not set in the environment. All admin routes are blocked.")
+            print("CRITICAL: ADMIN_API_KEY is not set. All admin routes are blocked.")
             return jsonify({"error": "Server configuration error: Admin API key not set."}), 500
         
         api_key = request.headers.get("x-api-key")
@@ -88,34 +90,31 @@ def admin_required(f):
             return jsonify({"error": "Unauthorized: Invalid or missing API key."}), 403
     return decorated_function
 
-# --- YouTube API Helper Functions ---
+# --- YouTube API Helper Functions (Updated to use SQLAlchemy) ---
 def get_active_live_video_id():
     if not YOUTUBE_API_KEY:
         print("Error: YOUTUBE_API_KEY is not configured.")
         return None
     try:
-        db = get_db()
-        cursor = db.cursor()
-        cursor.execute("SELECT channel_id FROM channels")
-        channels = cursor.fetchall()
+        # Use SQLAlchemy to get all channels from the database
+        channels = Channel.query.all()
         if not channels:
             print("No channels configured in the database to check for live streams.")
             return None
 
-        for row in channels:
-            channel_id = row["channel_id"]
+        for channel in channels:
             url = (
                 f"https://www.googleapis.com/youtube/v3/search?part=snippet"
-                f"&channelId={channel_id}&eventType=live&type=video&key={YOUTUBE_API_KEY}"
+                f"&channelId={channel.channel_id}&eventType=live&type=video&key={YOUTUBE_API_KEY}"
             )
-            print(f"Checking for live video on channel: {channel_id}")
+            print(f"Checking for live video on channel: {channel.channel_id}")
             r = requests.get(url, timeout=10)
             r.raise_for_status()
             data = r.json()
             items = data.get('items', [])
             if items:
                 video_id = items[0]['id']['videoId']
-                print(f"Found live video: {video_id} on channel {channel_id}")
+                print(f"Found live video: {video_id} on channel {channel.channel_id}")
                 return video_id
         print("No active live streams found on configured channels.")
         return None
@@ -127,16 +126,12 @@ def get_active_live_video_id():
         return None
 
 def get_stream_start_time(video_id):
-    if not YOUTUBE_API_KEY:
-        print("Error: YOUTUBE_API_KEY is not configured.")
-        return None
-    if not video_id:
-        print("Error: video_id is required to get stream start time.")
+    # This function did not interact with our database, so it remains unchanged.
+    if not YOUTUBE_API_KEY or not video_id:
+        print(f"Error: YOUTUBE_API_KEY configured: {bool(YOUTUBE_API_KEY)}, video_id provided: {bool(video_id)}")
         return None
     try:
-        url = (
-            f"https://www.googleapis.com/youtube/v3/videos?part=liveStreamingDetails&id={video_id}&key={YOUTUBE_API_KEY}"
-        )
+        url = f"https://www.googleapis.com/youtube/v3/videos?part=liveStreamingDetails&id={video_id}&key={YOUTUBE_API_KEY}"
         print(f"Fetching stream start time for video: {video_id}")
         r = requests.get(url, timeout=10)
         r.raise_for_status()
@@ -144,11 +139,9 @@ def get_stream_start_time(video_id):
         items = data.get("items", [])
         if items and "liveStreamingDetails" in items[0] and "actualStartTime" in items[0]["liveStreamingDetails"]:
             start_time_str = items[0]["liveStreamingDetails"]["actualStartTime"]
-            start_time = datetime.datetime.fromisoformat(start_time_str.replace("Z", "+00:00"))
-            print(f"Stream start time: {start_time}")
-            return start_time
+            return datetime.datetime.fromisoformat(start_time_str.replace("Z", "+00:00"))
         else:
-            print(f"Could not find live streaming details or actualStartTime for video {video_id}. Response: {data}")
+            print(f"Could not find live streaming details for video {video_id}. Response: {data}")
             return None
     except requests.exceptions.RequestException as e:
         print(f"Error fetching stream start time from YouTube API: {e}")
@@ -169,7 +162,7 @@ def ping():
 @app.route("/clip")
 def create_clip():
     user = request.args.get('user', 'someone')
-    name = request.args.get('name', '').strip() # Clip title part
+    name = request.args.get('name', '').strip()
     
     if not YOUTUBE_API_KEY:
         return jsonify({"error": "Server configuration error: YouTube API key not set."}), 500
@@ -183,49 +176,44 @@ def create_clip():
         return jsonify({"error": "Could not fetch stream start time for the live video."}), 500
 
     now_utc = datetime.datetime.now(pytz.utc)
-    if stream_start_utc.tzinfo is None:
-         stream_start_utc = pytz.utc.localize(stream_start_utc)
-
     clip_time_utc = now_utc - datetime.timedelta(seconds=35) 
 
-    if clip_time_utc < stream_start_utc:
-        print(f"Clip time ({clip_time_utc}) is before stream start time ({stream_start_utc}). Clipping from start.")
-        seconds_since_start = 0
-    else:
+    seconds_since_start = 0
+    if clip_time_utc > stream_start_utc:
         seconds_since_start = int((clip_time_utc - stream_start_utc).total_seconds())
     
     clip_url = f"https://www.youtube.com/watch?v={video_id}&t={seconds_since_start}s"
     thumbnail_url = f"https://i.ytimg.com/vi/{video_id}/mqdefault.jpg"
-    
     actual_clip_title = name if name else f"Clip by {user}"
 
-    # --- Enhanced Discord Logging ---
+    # --- Discord Notification Logic (Unchanged) ---
     if DISCORD_WEBHOOK_URL:
         discord_message_title = f" [{name}]" if name else ""
-        message = f"\ud83c\udfaC New Clip by **{user}**{discord_message_title}: {clip_url}"
+        message = f"🎬 New Clip by **{user}**{discord_message_title}: {clip_url}"
         try:
-            print(f"Attempting to send notification to Discord...")
+            print("Attempting to send notification to Discord...")
             response = requests.post(DISCORD_WEBHOOK_URL, json={"content": message}, timeout=5)
-            response.raise_for_status() # This will raise an error for 4xx/5xx responses
+            response.raise_for_status()
             print("Successfully sent notification to Discord.")
         except requests.exceptions.RequestException as e:
-            # This catches connection errors, timeouts, and HTTP error responses
-            print(f"ERROR: Failed to send clip notification to Discord. Status Code: {e.response.status_code if e.response else 'N/A'}. Error: {str(e)}")
+            print(f"ERROR sending to Discord. Status: {e.response.status_code if e.response else 'N/A'}. Error: {e}")
         except Exception as e:
-            print(f"ERROR: An unexpected error occurred while sending to Discord: {str(e)}")
+            print(f"ERROR: An unexpected error occurred while sending to Discord: {e}")
     else:
         print("INFO: DISCORD_WEBHOOK_URL not set. Skipping Discord notification.")
 
-
-    # Save to database
-    db = get_db()
+    # --- Save to PostgreSQL Database ---
     try:
-        cursor = db.cursor()
-        cursor.execute(
-            "INSERT INTO clips (title, user, clip_url, thumbnail_url, video_id, timestamp) VALUES (?, ?, ?, ?, ?, ?)",
-            (actual_clip_title, user, clip_url, thumbnail_url, video_id, now_utc.isoformat())
+        new_clip = Clip(
+            title=actual_clip_title,
+            user=user,
+            clip_url=clip_url,
+            thumbnail_url=thumbnail_url,
+            video_id=video_id,
+            timestamp=now_utc.isoformat()
         )
-        db.commit()
+        db.session.add(new_clip)
+        db.session.commit()
         print(f"Clip saved to DB: {actual_clip_title}")
         return jsonify({
             "message": "Clip created successfully",
@@ -233,15 +221,10 @@ def create_clip():
             "title": actual_clip_title,
             "user": user
         }), 200
-    except sqlite3.Error as e:
-        print(f"Database error saving clip: {e}")
-        db.rollback() # Rollback on error
-        return jsonify({"error": "Failed to save clip to database."}), 500
     except Exception as e:
-        print(f"An unexpected error occurred while saving clip to DB: {e}")
-        db.rollback()
-        return jsonify({"error": "An internal server error occurred."}), 500
-
+        db.session.rollback()
+        print(f"Database error saving clip: {e}")
+        return jsonify({"error": "Failed to save clip to database."}), 500
 
 @app.route("/api/clips")
 def get_clips_api():
@@ -249,63 +232,39 @@ def get_clips_api():
     limit = request.args.get('limit', 12, type=int)
     search_query = request.args.get('search', '').strip()
     
-    offset = (page - 1) * limit
-    
-    db = get_db()
-    cursor = db.cursor()
+    # Base query
+    query = Clip.query
 
-    base_query = "FROM clips"
-    conditions = []
-    params = []
-
+    # Apply search filter if provided
     if search_query:
-        conditions.append("(title LIKE ? OR user LIKE ?)")
-        params.extend([f"%{search_query}%", f"%{search_query}%"])
+        search_term = f"%{search_query}%"
+        query = query.filter(db.or_(Clip.title.ilike(search_term), Clip.user.ilike(search_term)))
 
-    where_clause = ""
-    if conditions:
-        where_clause = " WHERE " + " AND ".join(conditions)
+    # Order by most recent
+    query = query.order_by(Clip.timestamp.desc())
 
-    count_query = "SELECT COUNT(*) " + base_query + where_clause
-    
-    count_params = tuple(params) 
-    
-    cursor.execute(count_query, count_params)
-    total_clips = cursor.fetchone()[0]
-
-    data_query = "SELECT id, title, user, clip_url, thumbnail_url, video_id, timestamp " + \
-                 base_query + where_clause + " ORDER BY timestamp DESC LIMIT ? OFFSET ?"
-    
-    params.extend([limit, offset])
-    
-    cursor.execute(data_query, tuple(params))
-    clips_data = cursor.fetchall()
-
-    clips_list = [dict(clip) for clip in clips_data]
-
-    total_pages = max(1, (total_clips + limit - 1) // limit)
+    # Paginate the results
+    pagination = query.paginate(page=page, per_page=limit, error_out=False)
+    clips_data = [clip.to_dict() for clip in pagination.items]
 
     return jsonify({
-        "clips": clips_list,
+        "clips": clips_data,
         "pagination": {
-            "currentPage": page,
-            "itemsPerPage": limit,
-            "totalItems": total_clips,
-            "totalPages": total_pages
+            "currentPage": pagination.page,
+            "itemsPerPage": pagination.per_page,
+            "totalItems": pagination.total,
+            "totalPages": pagination.pages
         }
     })
 
-# --- Admin API Routes for Channels ---
+# --- Admin API Routes for Channels (Updated for SQLAlchemy) ---
 @app.route("/admin/channels", methods=["GET"])
 @admin_required
 def list_channels_api():
-    db = get_db()
-    cursor = db.cursor()
     try:
-        cursor.execute("SELECT id, channel_id, name FROM channels ORDER BY name")
-        channels = cursor.fetchall()
-        return jsonify([dict(row) for row in channels]), 200
-    except sqlite3.Error as e:
+        channels = Channel.query.order_by(Channel.name).all()
+        return jsonify([ch.to_dict() for ch in channels]), 200
+    except Exception as e:
         print(f"Database error listing channels: {e}")
         return jsonify({"error": "Failed to retrieve channels from database."}), 500
 
@@ -313,86 +272,57 @@ def list_channels_api():
 @admin_required
 def add_channel_api():
     data = request.json
-    if not data:
-        return jsonify({"error": "Request body must be JSON."}), 400
-        
-    channel_id = data.get("channel_id")
-    name = data.get("name")
-
-    if not channel_id:
+    if not data or 'channel_id' not in data:
         return jsonify({"error": "channel_id is required."}), 400
     
-    # Optional: Keep or remove based on your needs
-    if not (channel_id.startswith("UC") and len(channel_id) == 24):
-        print(f"Warning: Invalid YouTube Channel ID format provided: {channel_id}")
-        # return jsonify({"error": "Invalid YouTube Channel ID format. Must start with 'UC' and be 24 characters long."}), 400
+    channel_id = data.get("channel_id").strip()
+    name = data.get("name", "").strip() or None
 
-    db = get_db()
-    cursor = db.cursor()
     try:
-        cursor.execute("INSERT INTO channels (channel_id, name) VALUES (?, ?)", (channel_id, name))
-        db.commit()
-        new_channel_id = cursor.lastrowid
-        print(f"Channel added: ID={new_channel_id}, YT_ID={channel_id}, Name={name}")
-        return jsonify({
-            "message": "Channel added successfully.",
-            "id": new_channel_id,
-            "channel_id": channel_id,
-            "name": name
-        }), 201
-    except sqlite3.IntegrityError:
-        db.rollback()
+        new_channel = Channel(channel_id=channel_id, name=name)
+        db.session.add(new_channel)
+        db.session.commit()
+        print(f"Channel added: ID={new_channel.id}, YT_ID={channel_id}")
+        return jsonify(new_channel.to_dict()), 201
+    except IntegrityError:
+        db.session.rollback()
         print(f"Attempt to add duplicate channel_id: {channel_id}")
         return jsonify({"error": f"Channel with YouTube ID '{channel_id}' already exists."}), 409
-    except sqlite3.Error as e:
-        db.rollback()
+    except Exception as e:
+        db.session.rollback()
         print(f"Database error adding channel: {e}")
         return jsonify({"error": "Failed to add channel to database."}), 500
 
 @app.route("/admin/channels/<int:channel_db_id>", methods=["DELETE"])
 @admin_required
 def remove_channel_api(channel_db_id):
-    db = get_db()
-    cursor = db.cursor()
     try:
-        cursor.execute("SELECT id FROM channels WHERE id = ?", (channel_db_id,))
-        channel = cursor.fetchone()
-        if channel is None:
+        channel_to_delete = Channel.query.get(channel_db_id)
+        if channel_to_delete is None:
             return jsonify({"error": f"Channel with database ID {channel_db_id} not found."}), 404
-            
-        cursor.execute("DELETE FROM channels WHERE id = ?", (channel_db_id,))
-        db.commit()
-        if cursor.rowcount > 0:
-            print(f"Channel removed: DB_ID={channel_db_id}")
-            return jsonify({"message": f"Channel (DB ID: {channel_db_id}) removed successfully."}), 200
-        else:
-            print(f"Channel not found for deletion: DB_ID={channel_db_id}")
-            return jsonify({"error": f"Channel with database ID {channel_db_id} not found or already deleted."}), 404
-    except sqlite3.Error as e:
-        db.rollback()
+        
+        db.session.delete(channel_to_delete)
+        db.session.commit()
+        print(f"Channel removed: DB_ID={channel_db_id}")
+        return jsonify({"message": f"Channel (DB ID: {channel_db_id}) removed successfully."}), 200
+    except Exception as e:
+        db.session.rollback()
         print(f"Database error removing channel: {e}")
         return jsonify({"error": "Failed to remove channel from database."}), 500
 
-# Initialize DB on first request if not already done
-with app.app_context():
-    init_db()
-
+# --- Main Execution ---
 if __name__ == "__main__":
+    init_db() # Initialize the database schema on startup
+    
     print("--- Initializing Server ---")
     if not ADMIN_API_KEY:
-        print("WARNING: ADMIN_API_KEY is not set. Admin functionalities will be locked.")
-    else:
-        print("INFO: ADMIN_API_KEY is configured.")
-        
+        print("WARNING: ADMIN_API_KEY is not set. Admin features will be locked.")
     if not YOUTUBE_API_KEY:
-        print("WARNING: YT_API_KEY is not set. YouTube functionalities will fail.")
-    else:
-        print("INFO: YT_API_KEY is configured.")
-        
+        print("WARNING: YT_API_KEY is not set. YouTube features will fail.")
     if not DISCORD_WEBHOOK_URL:
-        print("WARNING: DISCORD_WEBHOOK_URL is not set. Clip notifications will not be sent to Discord.")
-    else:
-        print("INFO: Discord webhook is configured.")
+        print("WARNING: DISCORD_WEBHOOK_URL is not set. Discord notifications will be disabled.")
     print("-------------------------")
 
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8080)), debug=os.getenv("FLASK_DEBUG", "False").lower() == "true")
+    port = int(os.getenv("PORT", 8080))
+    debug = os.getenv("FLASK_DEBUG", "False").lower() == "true"
+    app.run(host="0.0.0.0", port=port, debug=debug)
