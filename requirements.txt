@@ -3,5 +3,5 @@ requests
 python-dotenv
 pytz
 flask-cors
+Flask-SQLAlchemy
 psycopg2-binary
-SQLAlchemy
