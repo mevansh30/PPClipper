@@ -77,7 +77,7 @@ def admin_required(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
         if not ADMIN_API_KEY:
-            print("ADMIN_API_KEY is not set in the environment.")
+            print("CRITICAL: ADMIN_API_KEY is not set in the environment. All admin routes are blocked.")
             return jsonify({"error": "Server configuration error: Admin API key not set."}), 500
         
         api_key = request.headers.get("x-api-key")
@@ -109,8 +109,8 @@ def get_active_live_video_id():
                 f"&channelId={channel_id}&eventType=live&type=video&key={YOUTUBE_API_KEY}"
             )
             print(f"Checking for live video on channel: {channel_id}")
-            r = requests.get(url, timeout=10) # Increased timeout
-            r.raise_for_status() # Will raise an HTTPError for bad responses (4xx or 5xx)
+            r = requests.get(url, timeout=10)
+            r.raise_for_status()
             data = r.json()
             items = data.get('items', [])
             if items:
@@ -138,13 +138,12 @@ def get_stream_start_time(video_id):
             f"https://www.googleapis.com/youtube/v3/videos?part=liveStreamingDetails&id={video_id}&key={YOUTUBE_API_KEY}"
         )
         print(f"Fetching stream start time for video: {video_id}")
-        r = requests.get(url, timeout=10) # Increased timeout
+        r = requests.get(url, timeout=10)
         r.raise_for_status()
         data = r.json()
         items = data.get("items", [])
         if items and "liveStreamingDetails" in items[0] and "actualStartTime" in items[0]["liveStreamingDetails"]:
             start_time_str = items[0]["liveStreamingDetails"]["actualStartTime"]
-            # Convert ISO 8601 string to datetime object
             start_time = datetime.datetime.fromisoformat(start_time_str.replace("Z", "+00:00"))
             print(f"Stream start time: {start_time}")
             return start_time
@@ -167,8 +166,6 @@ def home():
 def ping():
     return "pong", 200
 
-# This endpoint is for user-triggered clip creation (e.g., via a bookmarklet or direct call)
-# The frontend button for this has been removed as per request.
 @app.route("/clip")
 def create_clip():
     user = request.args.get('user', 'someone')
@@ -186,13 +183,9 @@ def create_clip():
         return jsonify({"error": "Could not fetch stream start time for the live video."}), 500
 
     now_utc = datetime.datetime.now(pytz.utc)
-    # Ensure stream_start_utc is timezone-aware (it should be from fromisoformat)
     if stream_start_utc.tzinfo is None:
          stream_start_utc = pytz.utc.localize(stream_start_utc)
 
-
-    # Calculate time for the clip (e.g., 35 seconds before "now")
-    # This logic might need adjustment based on how "clipping" is intended to work
     clip_time_utc = now_utc - datetime.timedelta(seconds=35) 
 
     if clip_time_utc < stream_start_utc:
@@ -201,23 +194,27 @@ def create_clip():
     else:
         seconds_since_start = int((clip_time_utc - stream_start_utc).total_seconds())
     
-    # Standard YouTube URL and Thumbnail
     clip_url = f"https://www.youtube.com/watch?v={video_id}&t={seconds_since_start}s"
-    thumbnail_url = f"https://i.ytimg.com/vi/{video_id}/mqdefault.jpg" # mqdefault or hqdefault
+    thumbnail_url = f"https://i.ytimg.com/vi/{video_id}/mqdefault.jpg"
     
     actual_clip_title = name if name else f"Clip by {user}"
 
-    # Send to Discord if URL is configured
+    # --- Enhanced Discord Logging ---
     if DISCORD_WEBHOOK_URL:
         discord_message_title = f" [{name}]" if name else ""
         message = f"\ud83c\udfaC New Clip by **{user}**{discord_message_title}: {clip_url}"
         try:
-            print(f"Sending to Discord: {message}")
-            requests.post(DISCORD_WEBHOOK_URL, json={"content": message}, timeout=5)
+            print(f"Attempting to send notification to Discord...")
+            response = requests.post(DISCORD_WEBHOOK_URL, json={"content": message}, timeout=5)
+            response.raise_for_status() # This will raise an error for 4xx/5xx responses
+            print("Successfully sent notification to Discord.")
         except requests.exceptions.RequestException as e:
-            print(f"Failed to send clip notification to Discord: {str(e)}")
+            # This catches connection errors, timeouts, and HTTP error responses
+            print(f"ERROR: Failed to send clip notification to Discord. Status Code: {e.response.status_code if e.response else 'N/A'}. Error: {str(e)}")
         except Exception as e:
-            print(f"An unexpected error occurred while sending to Discord: {str(e)}")
+            print(f"ERROR: An unexpected error occurred while sending to Discord: {str(e)}")
+    else:
+        print("INFO: DISCORD_WEBHOOK_URL not set. Skipping Discord notification.")
 
 
     # Save to database
@@ -251,8 +248,7 @@ def get_clips_api():
     page = request.args.get('page', 1, type=int)
     limit = request.args.get('limit', 12, type=int)
     search_query = request.args.get('search', '').strip()
-    # level_filter = request.args.get('level', 'all').strip() # Level filter not fully implemented in this version
-
+    
     offset = (page - 1) * limit
     
     db = get_db()
@@ -264,12 +260,7 @@ def get_clips_api():
 
     if search_query:
         conditions.append("(title LIKE ? OR user LIKE ?)")
-        # For SQLite, parameters for LIKE should include %
         params.extend([f"%{search_query}%", f"%{search_query}%"])
-
-    # if level_filter != 'all': # Example for future filter
-    #     conditions.append("level = ?")
-    #     params.append(level_filter)
 
     where_clause = ""
     if conditions:
@@ -277,7 +268,6 @@ def get_clips_api():
 
     count_query = "SELECT COUNT(*) " + base_query + where_clause
     
-    # Parameters for count query are same as for data query, excluding limit/offset
     count_params = tuple(params) 
     
     cursor.execute(count_query, count_params)
@@ -286,15 +276,14 @@ def get_clips_api():
     data_query = "SELECT id, title, user, clip_url, thumbnail_url, video_id, timestamp " + \
                  base_query + where_clause + " ORDER BY timestamp DESC LIMIT ? OFFSET ?"
     
-    # Add limit and offset to params for data query
     params.extend([limit, offset])
     
     cursor.execute(data_query, tuple(params))
     clips_data = cursor.fetchall()
 
-    clips_list = [dict(clip) for clip in clips_data] # Convert rows to dicts
+    clips_list = [dict(clip) for clip in clips_data]
 
-    total_pages = max(1, (total_clips + limit - 1) // limit) # Ensure at least 1 page
+    total_pages = max(1, (total_clips + limit - 1) // limit)
 
     return jsonify({
         "clips": clips_list,
@@ -328,14 +317,14 @@ def add_channel_api():
         return jsonify({"error": "Request body must be JSON."}), 400
         
     channel_id = data.get("channel_id")
-    name = data.get("name") # Optional, can be None or empty
+    name = data.get("name")
 
     if not channel_id:
         return jsonify({"error": "channel_id is required."}), 400
     
-    # Basic validation for YouTube channel ID format (UC followed by 22 chars)
+    # Optional: Keep or remove based on your needs
     if not (channel_id.startswith("UC") and len(channel_id) == 24):
-        print(f"Invalid YouTube Channel ID format: {channel_id}")
+        print(f"Warning: Invalid YouTube Channel ID format provided: {channel_id}")
         # return jsonify({"error": "Invalid YouTube Channel ID format. Must start with 'UC' and be 24 characters long."}), 400
 
     db = get_db()
@@ -347,11 +336,11 @@ def add_channel_api():
         print(f"Channel added: ID={new_channel_id}, YT_ID={channel_id}, Name={name}")
         return jsonify({
             "message": "Channel added successfully.",
-            "id": new_channel_id, # Return the database ID
+            "id": new_channel_id,
             "channel_id": channel_id,
             "name": name
         }), 201
-    except sqlite3.IntegrityError: # Handles UNIQUE constraint violation for channel_id
+    except sqlite3.IntegrityError:
         db.rollback()
         print(f"Attempt to add duplicate channel_id: {channel_id}")
         return jsonify({"error": f"Channel with YouTube ID '{channel_id}' already exists."}), 409
@@ -366,7 +355,6 @@ def remove_channel_api(channel_db_id):
     db = get_db()
     cursor = db.cursor()
     try:
-        # Check if channel exists before deleting
         cursor.execute("SELECT id FROM channels WHERE id = ?", (channel_db_id,))
         channel = cursor.fetchone()
         if channel is None:
@@ -378,7 +366,6 @@ def remove_channel_api(channel_db_id):
             print(f"Channel removed: DB_ID={channel_db_id}")
             return jsonify({"message": f"Channel (DB ID: {channel_db_id}) removed successfully."}), 200
         else:
-            # This case should be caught by the check above, but as a fallback
             print(f"Channel not found for deletion: DB_ID={channel_db_id}")
             return jsonify({"error": f"Channel with database ID {channel_db_id} not found or already deleted."}), 404
     except sqlite3.Error as e:
@@ -391,10 +378,21 @@ with app.app_context():
     init_db()
 
 if __name__ == "__main__":
-    # Make sure ADMIN_API_KEY is set before running for admin features to work
+    print("--- Initializing Server ---")
     if not ADMIN_API_KEY:
         print("WARNING: ADMIN_API_KEY is not set. Admin functionalities will be locked.")
+    else:
+        print("INFO: ADMIN_API_KEY is configured.")
+        
     if not YOUTUBE_API_KEY:
-        print("WARNING: YT_API_KEY is not set. YouTube related functionalities (creating clips, fetching live status) will fail.")
-    
+        print("WARNING: YT_API_KEY is not set. YouTube functionalities will fail.")
+    else:
+        print("INFO: YT_API_KEY is configured.")
+        
+    if not DISCORD_WEBHOOK_URL:
+        print("WARNING: DISCORD_WEBHOOK_URL is not set. Clip notifications will not be sent to Discord.")
+    else:
+        print("INFO: Discord webhook is configured.")
+    print("-------------------------")
+
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8080)), debug=os.getenv("FLASK_DEBUG", "False").lower() == "true")
